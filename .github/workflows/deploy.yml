@@ -1,0 +1,57 @@
+name: Deploy to GCP Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  BACKEND_IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/100days-backend
+  FRONTEND_IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/100days-frontend
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Configure Docker to use gcloud
+        run: gcloud auth configure-docker
+
+      - name: Build and Push Backend Image
+        run: |
+          docker build -t ${{ env.BACKEND_IMAGE }}:${{ github.sha }} ./backend
+          docker push ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+
+      - name: Build and Push Frontend Image
+        run: |
+          docker build \
+            --build-arg VITE_API_URL=${{ secrets.BACKEND_URL }} \
+            --build-arg VITE_GOOGLE_CLIENT_ID=${{ secrets.GOOGLE_CLIENT_ID }} \
+            -t ${{ env.FRONTEND_IMAGE }}:${{ github.sha }} ./frontend
+          docker push ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+
+      - name: Deploy Backend to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: hundred-days-backend
+          image: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          region: ${{ env.REGION }}
+          env_vars: |
+            ChallengeStoreDatabase__ConnectionString=${{ secrets.MONGODB_ATLAS_URI }}
+            Google__ClientId=${{ secrets.GOOGLE_CLIENT_ID }}
+
+      - name: Deploy Frontend to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: hundred-days-frontend
+          image: ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          region: ${{ env.REGION }}
