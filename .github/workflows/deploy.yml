@@ -45,6 +45,7 @@ jobs:
           service: hundred-days-backend
           image: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
           region: ${{ env.REGION }}
+          flags: '--allow-unauthenticated'
           env_vars: |
             ChallengeStoreDatabase__ConnectionString=${{ secrets.MONGODB_ATLAS_URI }}
             Google__ClientId=${{ secrets.GOOGLE_CLIENT_ID }}
@@ -55,3 +56,4 @@ jobs:
           service: hundred-days-frontend
           image: ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
           region: ${{ env.REGION }}
+          flags: '--port=80 --allow-unauthenticated'
