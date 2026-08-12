@@ -194,10 +194,15 @@ jobs:
              --configuration Release
              --logger "console;verbosity=normal"
 
+      # No version pinned here on purpose — the action reads the
+      # "packageManager" field in frontend/package.json, so CI, Docker and your
+      # laptop all use the same pnpm. Using "latest" previously meant pnpm could
+      # change under the build without a commit (that is how pnpm 11 silently
+      # dropped the onlyBuiltDependencies setting and broke the install).
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: latest
+          package_json_file: frontend/package.json
 
       - name: Set up Node
         uses: actions/setup-node@v4
