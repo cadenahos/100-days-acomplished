@@ -36,6 +36,8 @@ jobs:
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          MONGODB_ATLAS_URI: ${{ secrets.MONGODB_ATLAS_URI }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
         run: |
           missing=0
           if [ -z "$GCP_PROJECT_ID" ]; then
@@ -50,6 +52,50 @@ jobs:
           else
             echo "OK: deployer service account = $(echo "$GCP_SA_KEY" | jq -r .client_email)"
           fi
+
+          # Validate the app config BEFORE it is synced anywhere. Catching a bad
+          # value here is the difference between a 30-second failure and a green
+          # deploy of a broken app.
+          if [ -z "$MONGODB_ATLAS_URI" ]; then
+            echo "::error::MONGODB_ATLAS_URI is empty or not set."; missing=1
+          else
+            case "$MONGODB_ATLAS_URI" in
+              mongodb://*|mongodb+srv://*) echo "OK: Mongo URI scheme is valid" ;;
+              *) echo "::error::MONGODB_ATLAS_URI must start with mongodb:// or mongodb+srv://"; missing=1 ;;
+            esac
+            case "$MONGODB_ATLAS_URI" in
+              *localhost*|*127.0.0.1*)
+                echo "::error::MONGODB_ATLAS_URI points at localhost. Cloud Run has no local Mongo."
+                missing=1 ;;
+            esac
+            case "$MONGODB_ATLAS_URI" in
+              *"<"*|*">"*)
+                echo "::error::MONGODB_ATLAS_URI still contains a placeholder like <db_password>."
+                missing=1 ;;
+            esac
+            # An unencoded @ or : in the password splits the URI at the wrong
+            # place and yields a confusing authentication error.
+            creds="${MONGODB_ATLAS_URI#*://}"; creds="${creds%%@*}"
+            case "${creds#*:}" in
+              *[@/:\#\?]*)
+                echo "::error::The password in MONGODB_ATLAS_URI has an unencoded special character."
+                echo "::error::URL-encode it: @ = %40, # = %23, / = %2F, : = %3A"
+                missing=1 ;;
+            esac
+          fi
+
+          if [ -z "$GOOGLE_CLIENT_ID" ]; then
+            echo "::error::GOOGLE_CLIENT_ID is empty or not set."; missing=1
+          else
+            case "$GOOGLE_CLIENT_ID" in
+              *.apps.googleusercontent.com) echo "OK: Google client ID shape is valid" ;;
+              *) echo "::error::GOOGLE_CLIENT_ID should end in .apps.googleusercontent.com"; missing=1 ;;
+            esac
+            case "$GOOGLE_CLIENT_ID" in
+              GOCSPX-*) echo "::error::That looks like a client SECRET, not a client ID."; missing=1 ;;
+            esac
+          fi
+
           exit $missing
 
       - name: Authenticate to Google Cloud
@@ -62,75 +108,68 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      # Application config lives in Secret Manager, not in GitHub. Validate it
-      # HERE, before anything is built — an empty or malformed value used to
-      # produce a green run that deployed a broken app.
-      - name: Verify Secret Manager configuration
+      # ---------------------------------------------------------------------
+      # GitHub is the single source of truth. This step mirrors the values
+      # into Secret Manager so Cloud Run can mount them at runtime — no local
+      # gcloud, no manual console step, nothing to keep in sync by hand.
+      #
+      # A new secret VERSION is added only when the value actually changed, so
+      # re-running the pipeline does not pile up identical versions.
+      # ---------------------------------------------------------------------
+      - name: Sync GitHub secrets into Secret Manager
+        env:
+          MONGODB_ATLAS_URI: ${{ secrets.MONGODB_ATLAS_URI }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
         run: |
-          missing=0
+          set -euo pipefail
 
-          require_secret() {
-            local name="$1"
-            if ! gcloud secrets describe "$name" >/dev/null 2>&1; then
-              echo "::error::Secret Manager secret '$name' does not exist. Run ./scripts/setup-gcp.sh"
-              missing=1; return 1
-            fi
-            if ! gcloud secrets versions access latest --secret="$name" >/tmp/"$name".val 2>/dev/null; then
-              echo "::error::Cannot read '$name'. The deployer needs roles/secretmanager.admin (or secretAccessor)."
-              missing=1; return 1
-            fi
-            if [ ! -s /tmp/"$name".val ]; then
-              echo "::error::Secret '$name' exists but its latest version is empty."
-              missing=1; return 1
-            fi
-            echo "OK: $name exists and has a non-empty value ($(wc -c </tmp/"$name".val) bytes)"
-            return 0
-          }
+          gcloud services enable secretmanager.googleapis.com --quiet
 
-          if require_secret "${{ env.SECRET_MONGO }}"; then
-            uri=$(cat /tmp/${{ env.SECRET_MONGO }}.val)
-            case "$uri" in
-              mongodb://*|mongodb+srv://*) echo "OK: Mongo URI scheme is valid" ;;
-              *) echo "::error::Mongo URI must start with mongodb:// or mongodb+srv://"; missing=1 ;;
-            esac
-            case "$uri" in
-              *localhost*|*127.0.0.1*)
-                echo "::error::Mongo URI points at localhost. Cloud Run has no local Mongo."
-                missing=1 ;;
-            esac
-            case "$uri" in
-              *"<"*|*">"*|*"USER:PASS"*|*"password"*)
-                echo "::warning::Mongo URI still looks like a placeholder — check it was filled in." ;;
-            esac
-          fi
-
-          if require_secret "${{ env.SECRET_GOOGLE_CLIENT_ID }}"; then
-            cid=$(cat /tmp/${{ env.SECRET_GOOGLE_CLIENT_ID }}.val)
-            case "$cid" in
-              *.apps.googleusercontent.com) echo "OK: Google client ID shape is valid" ;;
-              *) echo "::error::Google client ID should end in .apps.googleusercontent.com"; missing=1 ;;
-            esac
-          fi
-
-          rm -f /tmp/*.val
-          exit $missing
-
-      - name: Verify Cloud Run can read the secrets at runtime
-        run: |
           PROJECT_NUMBER=$(gcloud projects describe "${{ secrets.GCP_PROJECT_ID }}" --format='value(projectNumber)')
           RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
           echo "Cloud Run runtime identity: $RUNTIME_SA"
 
+          sync_secret() {
+            local name="$1" value="$2" tmp
+            tmp=$(mktemp)
+            # printf, never echo — a trailing newline becomes part of the value
+            # and breaks connection strings in ways that look like auth errors.
+            printf '%s' "$value" > "$tmp"
+
+            if gcloud secrets describe "$name" >/dev/null 2>&1; then
+              if current=$(gcloud secrets versions access latest --secret="$name" 2>/dev/null) \
+                 && [ "$current" = "$value" ]; then
+                echo "unchanged: $name"
+              else
+                gcloud secrets versions add "$name" --data-file="$tmp" >/dev/null
+                echo "updated: $name (new version added)"
+              fi
+            else
+              gcloud secrets create "$name" --data-file="$tmp" --replication-policy=automatic >/dev/null
+              echo "created: $name"
+            fi
+            rm -f "$tmp"
+
+            # Idempotent; required or the revision fails to start with a
+            # permission error on the secret.
+            gcloud secrets add-iam-policy-binding "$name" \
+              --member="serviceAccount:${RUNTIME_SA}" \
+              --role="roles/secretmanager.secretAccessor" >/dev/null 2>&1
+            echo "  runtime SA can read $name"
+          }
+
+          sync_secret "${{ env.SECRET_MONGO }}"             "$MONGODB_ATLAS_URI"
+          sync_secret "${{ env.SECRET_GOOGLE_CLIENT_ID }}"  "$GOOGLE_CLIENT_ID"
+
+      - name: Confirm the sync landed
+        run: |
           missing=0
           for s in "${{ env.SECRET_MONGO }}" "${{ env.SECRET_GOOGLE_CLIENT_ID }}"; do
-            if gcloud secrets get-iam-policy "$s" --format=json 2>/dev/null \
-                 | jq -e --arg sa "serviceAccount:$RUNTIME_SA" \
-                     '.bindings[]? | select(.role=="roles/secretmanager.secretAccessor") | .members[]? | select(. == $sa)' \
-                 >/dev/null; then
-              echo "OK: runtime SA can access '$s'"
+            if bytes=$(gcloud secrets versions access latest --secret="$s" 2>/dev/null | wc -c) \
+               && [ "$bytes" -gt 0 ]; then
+              echo "OK: $s readable, $bytes bytes"
             else
-              echo "::error::The Cloud Run runtime SA lacks secretAccessor on '$s'. The revision will fail to start."
-              echo "::error::Fix: gcloud secrets add-iam-policy-binding $s --member=serviceAccount:$RUNTIME_SA --role=roles/secretmanager.secretAccessor"
+              echo "::error::'$s' is missing or empty after sync."
               missing=1
             fi
           done

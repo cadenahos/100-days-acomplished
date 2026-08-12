@@ -38,37 +38,39 @@ It's idempotent — safe to re-run. It prompts for the Mongo URI and Google
 client ID, stores them in Secret Manager, and prints the GitHub secrets to
 paste.
 
-### GitHub secrets — exactly 2
+### GitHub secrets — 4, and this is the only place you edit config
 
 | Secret | Value |
 |---|---|
 | `GCP_PROJECT_ID` | `my-project-123` |
 | `GCP_SA_KEY` | The deployer service-account JSON key, whole file |
+| `MONGODB_ATLAS_URI` | `mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority` |
+| `GOOGLE_CLIENT_ID` | `…apps.googleusercontent.com` |
 
-Everything app-level lives in GCP Secret Manager, so there is nothing to keep
-in sync between GitHub and GCP.
+**Delete `BACKEND_URL` if it still exists** — obsolete and actively misleading.
+The workflow now derives it from the backend deploy step's output.
 
-**Delete these if they still exist** — they are obsolete and actively
-misleading: `BACKEND_URL`, `MONGODB_ATLAS_URI`, `GOOGLE_CLIENT_ID`.
+### Secret Manager — populated automatically
 
-### GCP Secret Manager — 2 secrets
+You never create these by hand. The preflight job's **"Sync GitHub secrets into
+Secret Manager"** step mirrors them on every run:
 
-| Secret name | Value | Consumed as |
+| Secret name | Source | Consumed as |
 |---|---|---|
-| `mongodb-atlas-uri` | `mongodb+srv://user:pass@cluster.mongodb.net/HundredDaysDb?retryWrites=true&w=majority` | `ChallengeStoreDatabase__ConnectionString` |
-| `google-client-id` | `…apps.googleusercontent.com` | `Google__ClientId` (backend) and `VITE_GOOGLE_CLIENT_ID` (frontend build) |
+| `mongodb-atlas-uri` | `MONGODB_ATLAS_URI` | `ChallengeStoreDatabase__ConnectionString` |
+| `google-client-id` | `GOOGLE_CLIENT_ID` | `Google__ClientId` (backend) and `VITE_GOOGLE_CLIENT_ID` (frontend build) |
 
-The backend mounts these via `--set-secrets`, so the Mongo URI never appears in
-the Cloud Run service YAML, the workflow logs, or the console. The frontend
-build reads the client ID from the same entry, so backend and frontend cannot
-drift onto different client IDs.
+The sync creates the secret if absent, adds a new version **only when the value
+changed** (so re-runs don't pile up identical versions), and grants the Cloud
+Run runtime SA `secretAccessor` each time.
 
-To rotate either value:
+Why bother going through Secret Manager at all rather than plain env vars: the
+Mongo URI never appears in the Cloud Run service YAML or the console, and
+`--set-secrets` sidesteps the comma-delimiter bug that mangles replica-set host
+lists in `env_vars`.
 
-```bash
-printf 'NEW_VALUE' | gcloud secrets versions add mongodb-atlas-uri --data-file=-
-# then redeploy so the revision picks up :latest
-```
+**To rotate anything:** change the GitHub secret and re-run the pipeline. That's
+the whole procedure.
 
 ### APIs to enable
 

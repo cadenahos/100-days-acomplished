@@ -16,7 +16,10 @@ AR_REPO="${AR_REPO:-hundred-days}"
 SA_NAME="${SA_NAME:-github-deployer}"
 BACKEND_SERVICE="${BACKEND_SERVICE:-hundred-days-backend}"
 FRONTEND_SERVICE="${FRONTEND_SERVICE:-hundred-days-frontend}"
-KEY_OUT="${KEY_OUT:-./gcp-sa-key.json}"
+# Default OUTSIDE the repo. Writing a service-account key into a git work tree
+# is how it ends up committed — GitHub push protection will block the push, but
+# only after the key is already in your local history.
+KEY_OUT="${KEY_OUT:-${TMPDIR:-/tmp}/gcp-sa-key.json}"
 
 GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; RED=$'\033[31m'; DIM=$'\033[2m'; OFF=$'\033[0m'
 step() { printf '\n%s==> %s%s\n' "$BLUE" "$1" "$OFF"; }
@@ -95,51 +98,21 @@ fi
 note "Images will be pushed to ${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/"
 
 # ---------------------------------------------------------------------------
-step "5/6  Storing application secrets in Secret Manager"
-
-# upsert_secret <name> <prompt> [silent]
-upsert_secret() {
-  local name="$1" prompt="$2" silent="${3:-}" value=""
-
-  if gcloud secrets describe "$name" >/dev/null 2>&1; then
-    printf '  Secret %s already exists. Add a new version? [y/N] ' "$name"
-    read -r reply </dev/tty
-    case "$reply" in
-      y|Y) ;;
-      *) ok "Kept existing $name"; return ;;
-    esac
-  else
-    gcloud secrets create "$name" --replication-policy=automatic >/dev/null
-    note "Created secret container $name"
-  fi
-
-  if [ -n "$silent" ]; then
-    printf '  %s: ' "$prompt"; read -rs value </dev/tty; echo
-  else
-    printf '  %s: ' "$prompt"; read -r value </dev/tty
-  fi
-  [ -n "$value" ] || die "Empty value for $name"
-
-  printf '%s' "$value" | gcloud secrets versions add "$name" --data-file=- >/dev/null
-  ok "Stored a new version of $name"
-}
-
-echo "  Mongo URI format: mongodb+srv://USER:PASS@cluster.mongodb.net/HundredDaysDb?retryWrites=true&w=majority"
-upsert_secret "mongodb-atlas-uri" "MongoDB Atlas connection URI" silent
-upsert_secret "google-client-id"  "Google OAuth client ID (…apps.googleusercontent.com)"
-
-# The Cloud Run runtime identity must be able to read the secret values.
-# Missing this is the #1 cause of a revision that fails to start with a
-# "Permission denied on secret" error.
-for secret in mongodb-atlas-uri google-client-id; do
-  gcloud secrets add-iam-policy-binding "$secret" \
-    --member="serviceAccount:${RUNTIME_SA}" \
-    --role="roles/secretmanager.secretAccessor" >/dev/null
-  ok "Cloud Run can read $secret"
-done
+step "5/6  Application secrets"
+note "Nothing to do here — the pipeline handles it."
+note "The 'Sync GitHub secrets into Secret Manager' step in deploy.yml creates"
+note "mongodb-atlas-uri and google-client-id from your GitHub secrets on every"
+note "run, and grants ${RUNTIME_SA} read access."
+ok "Skipped by design"
 
 # ---------------------------------------------------------------------------
 step "6/6  Creating a service-account key for GitHub"
+# Refuse to write a credential anywhere git might pick it up.
+KEY_DIR=$(cd "$(dirname "$KEY_OUT")" 2>/dev/null && pwd || echo "")
+if [ -n "$KEY_DIR" ] && git -C "$KEY_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  die "KEY_OUT ($KEY_OUT) is inside a git repository. Choose a path outside it, e.g. KEY_OUT=~/gcp-sa-key.json"
+fi
+
 if [ -f "$KEY_OUT" ]; then
   note "$KEY_OUT already exists — not overwriting."
 else
@@ -152,28 +125,29 @@ cat <<EOF
 
 ${GREEN}GCP setup complete.${OFF}
 
-${BLUE}GitHub needs exactly 2 secrets${OFF}
+${BLUE}GitHub needs these 4 secrets${OFF}
   Repo → Settings → Secrets and variables → Actions → New repository secret
 
   GCP_PROJECT_ID      ${PROJECT_ID}
   GCP_SA_KEY          <entire contents of ${KEY_OUT}>
+  MONGODB_ATLAS_URI   mongodb+srv://USER:PASS@cluster.mongodb.net/...
+  GOOGLE_CLIENT_ID    ....apps.googleusercontent.com
 
-  ${DIM}That is all. The Mongo URI and Google client ID now live only in Secret
-  Manager — the workflow reads them from GCP, so there is nothing to keep in
-  sync between GitHub and GCP.${OFF}
+  ${DIM}GitHub is the single source of truth. The pipeline mirrors the last two
+  into Secret Manager on every run, so you never touch gcloud to change them.${OFF}
 
 With the gh CLI:
 
   gh secret set GCP_PROJECT_ID --body "${PROJECT_ID}"
   gh secret set GCP_SA_KEY     < "${KEY_OUT}"
+  gh secret set MONGODB_ATLAS_URI
+  gh secret set GOOGLE_CLIENT_ID
 
 ${YELLOW}Then delete the local key file — it is a long-lived credential:${OFF}
   rm ${KEY_OUT}
 
-${YELLOW}Delete these now-obsolete GitHub secrets if they exist:${OFF}
+${YELLOW}Delete this obsolete GitHub secret if it still exists:${OFF}
   gh secret delete BACKEND_URL
-  gh secret delete MONGODB_ATLAS_URI
-  gh secret delete GOOGLE_CLIENT_ID
 
 ${YELLOW}Finally, MongoDB Atlas → Network Access:${OFF}
   Add 0.0.0.0/0. Cloud Run egress IPs are dynamic, so without this the backend

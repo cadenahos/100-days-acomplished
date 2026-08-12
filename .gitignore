@@ -13,6 +13,15 @@
 ehthumbs.db
 Thumbs.db
 
+# Credentials — never commit these
+*-sa-key.json
+gcp-sa-key.json
+*-credentials.json
+service-account*.json
+*.pem
+*.p12
+*.key
+
 # Project specific
 node_modules/
 bin/
