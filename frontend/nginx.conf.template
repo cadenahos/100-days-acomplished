@@ -1,0 +1,75 @@
+# Rendered at container start by docker-entrypoint.sh (envsubst).
+# ${PORT} and ${BACKEND_URL} are injected by Cloud Run / docker run.
+
+log_format proxylog escape=json
+    '{"time":"$time_iso8601","method":"$request_method","uri":"$request_uri",'
+    '"status":$status,"upstream":"$upstream_addr","upstream_status":"$upstream_status",'
+    '"upstream_time":"$upstream_response_time","bytes":$body_bytes_sent,'
+    '"referer":"$http_referer","agent":"$http_user_agent"}';
+
+server {
+    listen ${PORT};
+    server_name _;
+
+    access_log /dev/stdout proxylog;
+    error_log  /dev/stderr warn;
+
+    # ---------------------------------------------------------------------
+    # API proxy. The browser only ever talks to this origin, so there is no
+    # CORS, no build-time API URL, and no stale-secret failure mode.
+    # BACKEND_URL is read at container start, not at image build time.
+    # ---------------------------------------------------------------------
+    location /api/ {
+        proxy_pass ${BACKEND_URL};
+
+        # Cloud Run routes by Host header and requires SNI on the TLS
+        # handshake. Both of these are mandatory or you get 404s.
+        proxy_set_header Host $proxy_host;
+        proxy_ssl_server_name on;
+
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header Authorization     $http_authorization;
+        proxy_pass_header Authorization;
+
+        proxy_http_version 1.1;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+
+        # Surface upstream failures as readable JSON instead of nginx's
+        # default HTML error page, so the browser console shows the cause.
+        proxy_intercept_errors on;
+        error_page 502 503 504 = @backend_down;
+    }
+
+    # Backend diagnostics, reachable through the frontend origin.
+    # e.g. https://<frontend-url>/health/db
+    location /health {
+        proxy_pass ${BACKEND_URL};
+        proxy_set_header Host $proxy_host;
+        proxy_ssl_server_name on;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 15s;
+        proxy_intercept_errors on;
+        error_page 502 503 504 = @backend_down;
+    }
+
+    location @backend_down {
+        default_type application/json;
+        return 503 '{"error":"backend_unreachable","proxied_to":"${BACKEND_URL}","hint":"nginx could not reach the Cloud Run backend. Check that BACKEND_URL is set on the frontend service and that the backend allows unauthenticated access."}';
+    }
+
+    # Proxy's own liveness check — does not touch the backend.
+    location = /_frontend_health {
+        default_type application/json;
+        return 200 '{"status":"ok","proxying_to":"${BACKEND_URL}"}';
+    }
+
+    location / {
+        root /usr/share/nginx/html;
+        index index.html index.htm;
+        try_files $uri $uri/ /index.html;
+    }
+}

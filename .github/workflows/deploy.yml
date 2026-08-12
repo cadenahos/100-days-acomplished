@@ -4,56 +4,416 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      skip_smoke_tests:
+        description: 'Deploy without failing the run on smoke-test errors'
+        type: boolean
+        default: false
 
 env:
-  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   REGION: us-central1
-  BACKEND_IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/100days-backend
-  FRONTEND_IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/100days-frontend
+  # Artifact Registry replaced Container Registry (gcr.io), which Google has
+  # shut down. Pushes to gcr.io now fail or silently redirect.
+  AR_REPO: hundred-days
+  BACKEND_SERVICE: hundred-days-backend
+  FRONTEND_SERVICE: hundred-days-frontend
+  # Secret Manager secret names (created by scripts/setup-gcp.sh). The values
+  # are mounted into Cloud Run at runtime and never appear in the service
+  # config, the workflow logs, or the GCP console.
+  SECRET_MONGO: mongodb-atlas-uri
+  SECRET_GOOGLE_CLIENT_ID: google-client-id
 
 jobs:
-  build-and-deploy:
+  # ---------------------------------------------------------------------------
+  # Fail fast on missing secrets. Previously an empty secret produced a green
+  # build that deployed a broken app — the exact "runs but won't connect" case.
+  # ---------------------------------------------------------------------------
+  preflight:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Verify GitHub secrets
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          missing=0
+          if [ -z "$GCP_PROJECT_ID" ]; then
+            echo "::error::GCP_PROJECT_ID is empty or not set."; missing=1
+          else
+            echo "OK: GCP_PROJECT_ID = $GCP_PROJECT_ID"
+          fi
+
+          if ! echo "$GCP_SA_KEY" | jq -e '.client_email and .private_key' >/dev/null 2>&1; then
+            echo "::error::GCP_SA_KEY is missing or is not valid service-account JSON (needs client_email and private_key)."
+            missing=1
+          else
+            echo "OK: deployer service account = $(echo "$GCP_SA_KEY" | jq -r .client_email)"
+          fi
+          exit $missing
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Configure Docker to use gcloud
-        run: gcloud auth configure-docker
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Build and Push Backend Image
+      # Application config lives in Secret Manager, not in GitHub. Validate it
+      # HERE, before anything is built — an empty or malformed value used to
+      # produce a green run that deployed a broken app.
+      - name: Verify Secret Manager configuration
         run: |
-          docker build -t ${{ env.BACKEND_IMAGE }}:${{ github.sha }} ./backend
-          docker push ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          missing=0
 
-      - name: Build and Push Frontend Image
+          require_secret() {
+            local name="$1"
+            if ! gcloud secrets describe "$name" >/dev/null 2>&1; then
+              echo "::error::Secret Manager secret '$name' does not exist. Run ./scripts/setup-gcp.sh"
+              missing=1; return 1
+            fi
+            if ! gcloud secrets versions access latest --secret="$name" >/tmp/"$name".val 2>/dev/null; then
+              echo "::error::Cannot read '$name'. The deployer needs roles/secretmanager.admin (or secretAccessor)."
+              missing=1; return 1
+            fi
+            if [ ! -s /tmp/"$name".val ]; then
+              echo "::error::Secret '$name' exists but its latest version is empty."
+              missing=1; return 1
+            fi
+            echo "OK: $name exists and has a non-empty value ($(wc -c </tmp/"$name".val) bytes)"
+            return 0
+          }
+
+          if require_secret "${{ env.SECRET_MONGO }}"; then
+            uri=$(cat /tmp/${{ env.SECRET_MONGO }}.val)
+            case "$uri" in
+              mongodb://*|mongodb+srv://*) echo "OK: Mongo URI scheme is valid" ;;
+              *) echo "::error::Mongo URI must start with mongodb:// or mongodb+srv://"; missing=1 ;;
+            esac
+            case "$uri" in
+              *localhost*|*127.0.0.1*)
+                echo "::error::Mongo URI points at localhost. Cloud Run has no local Mongo."
+                missing=1 ;;
+            esac
+            case "$uri" in
+              *"<"*|*">"*|*"USER:PASS"*|*"password"*)
+                echo "::warning::Mongo URI still looks like a placeholder — check it was filled in." ;;
+            esac
+          fi
+
+          if require_secret "${{ env.SECRET_GOOGLE_CLIENT_ID }}"; then
+            cid=$(cat /tmp/${{ env.SECRET_GOOGLE_CLIENT_ID }}.val)
+            case "$cid" in
+              *.apps.googleusercontent.com) echo "OK: Google client ID shape is valid" ;;
+              *) echo "::error::Google client ID should end in .apps.googleusercontent.com"; missing=1 ;;
+            esac
+          fi
+
+          rm -f /tmp/*.val
+          exit $missing
+
+      - name: Verify Cloud Run can read the secrets at runtime
         run: |
-          docker build \
-            --build-arg VITE_API_URL=${{ secrets.BACKEND_URL }} \
-            --build-arg VITE_GOOGLE_CLIENT_ID=${{ secrets.GOOGLE_CLIENT_ID }} \
-            -t ${{ env.FRONTEND_IMAGE }}:${{ github.sha }} ./frontend
-          docker push ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          PROJECT_NUMBER=$(gcloud projects describe "${{ secrets.GCP_PROJECT_ID }}" --format='value(projectNumber)')
+          RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+          echo "Cloud Run runtime identity: $RUNTIME_SA"
 
-      - name: Deploy Backend to Cloud Run
+          missing=0
+          for s in "${{ env.SECRET_MONGO }}" "${{ env.SECRET_GOOGLE_CLIENT_ID }}"; do
+            if gcloud secrets get-iam-policy "$s" --format=json 2>/dev/null \
+                 | jq -e --arg sa "serviceAccount:$RUNTIME_SA" \
+                     '.bindings[]? | select(.role=="roles/secretmanager.secretAccessor") | .members[]? | select(. == $sa)' \
+                 >/dev/null; then
+              echo "OK: runtime SA can access '$s'"
+            else
+              echo "::error::The Cloud Run runtime SA lacks secretAccessor on '$s'. The revision will fail to start."
+              echo "::error::Fix: gcloud secrets add-iam-policy-binding $s --member=serviceAccount:$RUNTIME_SA --role=roles/secretmanager.secretAccessor"
+              missing=1
+            fi
+          done
+          exit $missing
+
+  # ---------------------------------------------------------------------------
+  # Backend: build, push, deploy, then verify it is genuinely healthy before
+  # the frontend is allowed to point at it.
+  # ---------------------------------------------------------------------------
+  backend:
+    needs: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Show active gcloud identity
+        run: |
+          gcloud config list
+          gcloud auth list
+          echo "Project: $(gcloud config get-value project)"
+
+      - name: Ensure Artifact Registry repository exists
+        run: |
+          if ! gcloud artifacts repositories describe "${{ env.AR_REPO }}" \
+                --location="${{ env.REGION }}" >/dev/null 2>&1; then
+            echo "Creating Artifact Registry repo ${{ env.AR_REPO }}..."
+            gcloud artifacts repositories create "${{ env.AR_REPO }}" \
+              --repository-format=docker \
+              --location="${{ env.REGION }}" \
+              --description="Images for 100-days-doing-something"
+          else
+            echo "Artifact Registry repo already exists."
+          fi
+
+      - name: Configure Docker auth for Artifact Registry
+        run: gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push backend image
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/backend"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" ./backend
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+
+      - id: deploy
+        name: Deploy backend to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
-          service: hundred-days-backend
-          image: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          service: ${{ env.BACKEND_SERVICE }}
+          image: ${{ env.IMAGE }}:${{ github.sha }}
           region: ${{ env.REGION }}
-          flags: '--allow-unauthenticated'
+          flags: '--allow-unauthenticated --port=8080 --cpu=1 --memory=512Mi --timeout=60s --min-instances=0'
+          # Values come from Secret Manager, so the Mongo URI never lands in
+          # the service YAML. This also sidesteps the comma-delimiter bug that
+          # used to mangle replica-set host lists in env_vars.
+          secrets: |
+            ChallengeStoreDatabase__ConnectionString=${{ env.SECRET_MONGO }}:latest
+            Google__ClientId=${{ env.SECRET_GOOGLE_CLIENT_ID }}:latest
+          secrets_update_strategy: overwrite
           env_vars: |
-            ChallengeStoreDatabase__ConnectionString=${{ secrets.MONGODB_ATLAS_URI }}
-            Google__ClientId=${{ secrets.GOOGLE_CLIENT_ID }}
+            ASPNETCORE_ENVIRONMENT=Production
+          env_vars_update_strategy: overwrite
 
-      - name: Deploy Frontend to Cloud Run
+      - name: Report backend URL
+        run: |
+          echo "Backend URL: ${{ steps.deploy.outputs.url }}"
+          echo "### Backend deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.deploy.outputs.url }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test — backend liveness
+        id: smoke_live
+        run: |
+          URL="${{ steps.deploy.outputs.url }}"
+          echo "GET $URL/health"
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /tmp/live.json -w '%{http_code}' --max-time 30 "$URL/health" || echo 000)
+            echo "attempt $i -> HTTP $code"
+            [ "$code" = "200" ] && break
+            sleep 6
+          done
+          cat /tmp/live.json || true; echo
+          if [ "$code" != "200" ]; then
+            echo "::error::Backend is not serving /health (HTTP $code). The container is not starting or not listening on \$PORT."
+            exit 1
+          fi
+
+      - name: Smoke test — backend configuration
+        run: |
+          URL="${{ steps.deploy.outputs.url }}"
+          curl -s --max-time 30 "$URL/health/config" | tee /tmp/config.json | jq . || cat /tmp/config.json
+          echo
+          if jq -e '.mongoIsLocalhostFallback == true' /tmp/config.json >/dev/null 2>&1; then
+            echo "::error::Backend fell back to a localhost Mongo connection string — the env var did not reach the container."
+            exit 1
+          fi
+          if jq -e '.googleClientIdSet == false' /tmp/config.json >/dev/null 2>&1; then
+            echo "::error::Google__ClientId did not reach the container. Every authenticated request will 401."
+            exit 1
+          fi
+          echo "Config looks correct."
+
+      - name: Smoke test — backend can reach MongoDB Atlas
+        run: |
+          URL="${{ steps.deploy.outputs.url }}"
+          code=$(curl -s -o /tmp/db.json -w '%{http_code}' --max-time 45 "$URL/health/db" || echo 000)
+          echo "HTTP $code"
+          cat /tmp/db.json | jq . 2>/dev/null || cat /tmp/db.json; echo
+          if [ "$code" != "200" ]; then
+            echo "::error::Backend cannot reach MongoDB Atlas. This is the most common cause of a deploy that 'runs but does not connect'."
+            echo "::error::Check: (1) MONGODB_ATLAS_URI user/password/database, (2) Atlas Network Access allows 0.0.0.0/0 or your Cloud Run egress IP."
+            exit 1
+          fi
+
+      - name: Dump backend Cloud Run logs on failure
+        if: failure()
+        run: |
+          echo "=== Last 100 log entries for ${{ env.BACKEND_SERVICE }} ==="
+          gcloud logging read \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="${{ env.BACKEND_SERVICE }}"' \
+            --limit=100 --format='value(timestamp, severity, textPayload, jsonPayload.message)' \
+            --freshness=15m || true
+          echo "=== Service description ==="
+          gcloud run services describe "${{ env.BACKEND_SERVICE }}" \
+            --region="${{ env.REGION }}" --format=yaml || true
+
+  # ---------------------------------------------------------------------------
+  # Frontend: depends on the backend job, so it can never be pointed at a
+  # backend that failed its health checks.
+  # ---------------------------------------------------------------------------
+  frontend:
+    needs: backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure Docker auth for Artifact Registry
+        run: gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+
+      - name: Validate backend URL from previous job
+        run: |
+          URL="${{ needs.backend.outputs.url }}"
+          if [ -z "$URL" ]; then
+            echo "::error::Backend job produced no URL. Cannot configure the frontend proxy."
+            exit 1
+          fi
+          echo "Frontend will proxy /api to: $URL"
+
+      # The Google client ID is a public value, but it must match what the
+      # backend validates against. Reading it from the same Secret Manager
+      # entry the backend uses guarantees the two can never drift apart.
+      - name: Read Google client ID from Secret Manager
+        run: |
+          CID=$(gcloud secrets versions access latest --secret="${{ env.SECRET_GOOGLE_CLIENT_ID }}")
+          if [ -z "$CID" ]; then
+            echo "::error::Google client ID is empty — Google sign-in would silently fail."
+            exit 1
+          fi
+          echo "Using client ID ending in ...${CID: -24}"
+          echo "GOOGLE_CLIENT_ID=$CID" >> "$GITHUB_ENV"
+
+      - name: Build and push frontend image
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/frontend"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          # Note: no VITE_API_URL. The API base is the relative path /api and
+          # nginx resolves the backend at container start from BACKEND_URL.
+          docker build \
+            --build-arg VITE_GOOGLE_CLIENT_ID="$GOOGLE_CLIENT_ID" \
+            -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" ./frontend
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+
+      - id: deploy
+        name: Deploy frontend to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
-          service: hundred-days-frontend
-          image: ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          service: ${{ env.FRONTEND_SERVICE }}
+          image: ${{ env.IMAGE }}:${{ github.sha }}
           region: ${{ env.REGION }}
-          flags: '--port=80 --allow-unauthenticated'
+          flags: '--allow-unauthenticated --port=8080 --cpu=1 --memory=256Mi'
+          env_vars: |
+            BACKEND_URL=${{ needs.backend.outputs.url }}
+          env_vars_update_strategy: overwrite
+
+      - name: Smoke test — frontend serves and proxies
+        run: |
+          URL="${{ steps.deploy.outputs.url }}"
+          echo "Frontend URL: $URL"
+
+          echo "--- index.html ---"
+          code=$(curl -s -o /tmp/index.html -w '%{http_code}' --max-time 30 "$URL/" || echo 000)
+          echo "HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::Frontend is not serving index.html (HTTP $code)."
+            exit 1
+          fi
+
+          echo "--- proxy self-check ---"
+          curl -s --max-time 30 "$URL/_frontend_health" | jq . || true
+          echo
+
+          echo "--- proxied backend liveness ---"
+          code=$(curl -s -o /tmp/proxy_health.json -w '%{http_code}' --max-time 30 "$URL/health" || echo 000)
+          echo "HTTP $code"
+          cat /tmp/proxy_health.json; echo
+          if [ "$code" != "200" ]; then
+            echo "::error::The frontend cannot proxy to the backend. nginx is up but /health did not pass through."
+            exit 1
+          fi
+
+          echo "--- proxied backend → mongo ---"
+          code=$(curl -s -o /tmp/proxy_db.json -w '%{http_code}' --max-time 45 "$URL/health/db" || echo 000)
+          echo "HTTP $code"; cat /tmp/proxy_db.json; echo
+          [ "$code" = "200" ] || { echo "::error::Proxied DB check failed."; exit 1; }
+
+          echo "--- API requires auth (expect 401, NOT 404/503) ---"
+          code=$(curl -s -o /tmp/api.json -w '%{http_code}' --max-time 30 "$URL/api/Challenges/my" || echo 000)
+          echo "HTTP $code"; cat /tmp/api.json; echo
+          case "$code" in
+            401) echo "Correct: the API is reachable and rejecting anonymous calls." ;;
+            404) echo "::error::404 from /api — nginx proxy path rewriting is wrong, or the Host header is not reaching Cloud Run."; exit 1 ;;
+            503) echo "::error::503 from /api — nginx cannot reach the backend. Check BACKEND_URL on the frontend service."; exit 1 ;;
+            200) echo "::warning::/api/Challenges/my returned 200 without a token — authentication is not being enforced." ;;
+            *)   echo "::error::Unexpected status $code from /api."; exit 1 ;;
+          esac
+
+      - name: Write deployment summary
+        if: always()
+        run: |
+          {
+            echo "## Deployment"
+            echo ""
+            echo "| Service | URL |"
+            echo "|---|---|"
+            echo "| Backend | ${{ needs.backend.outputs.url }} |"
+            echo "| Frontend | ${{ steps.deploy.outputs.url }} |"
+            echo ""
+            echo "### Diagnostics"
+            echo ""
+            echo "- Backend liveness: ${{ needs.backend.outputs.url }}/health"
+            echo "- Backend config: ${{ needs.backend.outputs.url }}/health/config"
+            echo "- Backend → Mongo: ${{ needs.backend.outputs.url }}/health/db"
+            echo "- Through the proxy: ${{ steps.deploy.outputs.url }}/health/db"
+            echo "- Proxy target: ${{ steps.deploy.outputs.url }}/_frontend_health"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dump frontend Cloud Run logs on failure
+        if: failure()
+        run: |
+          echo "=== Last 100 log entries for ${{ env.FRONTEND_SERVICE }} ==="
+          gcloud logging read \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="${{ env.FRONTEND_SERVICE }}"' \
+            --limit=100 --format='value(timestamp, severity, textPayload, jsonPayload.message)' \
+            --freshness=15m || true
+          echo "=== Frontend service description ==="
+          gcloud run services describe "${{ env.FRONTEND_SERVICE }}" \
+            --region="${{ env.REGION }}" --format=yaml || true
+          echo "=== Backend logs (for cross-checking) ==="
+          gcloud logging read \
+            'resource.type="cloud_run_revision" AND resource.labels.service_name="${{ env.BACKEND_SERVICE }}"' \
+            --limit=50 --format='value(timestamp, severity, textPayload, jsonPayload.message)' \
+            --freshness=15m || true

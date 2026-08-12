@@ -1,59 +1,54 @@
 import { useState, useEffect } from 'react';
 import { GoogleLogin } from '@react-oauth/google';
 import { useNavigate } from 'react-router-dom';
+import { apiFetch, ApiError } from '../lib/api';
 
 export default function Home({ token, setToken, logout }) {
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
   const [myChallenges, setMyChallenges] = useState([]);
+  const [error, setError] = useState(null);
   const navigate = useNavigate();
 
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5048';
-
   useEffect(() => {
-    if (token) {
-      fetch(`${apiUrl}/api/Challenges/my`, {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      })
-      .then(res => {
-        if (res.status === 401) {
-          logout();
-          throw new Error('Unauthorized');
-        }
-        if (!res.ok) throw new Error('Failed to fetch');
-        return res.json();
-      })
+    if (!token) return;
+    let cancelled = false;
+
+    apiFetch('/Challenges/my', { token })
       .then(data => {
+        if (cancelled) return;
+        setError(null);
         if (Array.isArray(data)) setMyChallenges(data);
       })
-      .catch(console.error);
-    }
-  }, [token, apiUrl]);
+      .catch(err => {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.status === 401) {
+          logout();
+          return;
+        }
+        setError(describe(err));
+      });
+
+    return () => { cancelled = true; };
+  }, [token, logout]);
 
   const handleCreate = async () => {
     if (!name.trim() || !token) return;
     setLoading(true);
+    setError(null);
     try {
-      const response = await fetch(`${apiUrl}/api/Challenges`, {
+      const data = await apiFetch('/Challenges', {
+        token,
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ name })
+        body: { name },
       });
-      if (response.status === 401) {
+      if (data && data.id) navigate(`/${data.id}`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
         logout();
         return;
       }
-      const data = await response.json();
-      if (data && data.id) {
-        navigate(`/${data.id}`);
-      }
-    } catch (error) {
-      console.error('Error creating challenge:', error);
+      setError(describe(err));
     } finally {
       setLoading(false);
     }
@@ -87,6 +82,17 @@ export default function Home({ token, setToken, logout }) {
       >
         Sign Out
       </button>
+
+      {error && (
+        <div className="w-full max-w-2xl rounded-2xl border border-red-500/40 bg-red-950/50 px-6 py-4 text-red-200">
+          <p className="font-bold mb-1">Can&apos;t reach the API</p>
+          <p className="text-sm opacity-90">{error}</p>
+          <p className="text-xs opacity-70 mt-2">
+            Open the browser console and run <code>__apiDiagnostics()</code> to see
+            which layer is failing.
+          </p>
+        </div>
+      )}
 
       {/* Input Section */}
       <div className="w-full flex flex-col items-center">
@@ -136,4 +142,13 @@ export default function Home({ token, setToken, logout }) {
       )}
     </div>
   );
+}
+
+function describe(err) {
+  if (err instanceof ApiError) {
+    if (!err.status) return 'The request never reached the server (network/proxy failure).';
+    if (err.status === 503) return 'The API proxy is up but the backend or its database is not responding.';
+    return `Server responded ${err.status}.`;
+  }
+  return String(err?.message ?? err);
 }

@@ -1,59 +1,65 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { apiFetch, ApiError } from '../lib/api';
 
 export default function ChallengeView({ token, logout }) {
   const { challengeId } = useParams();
   const navigate = useNavigate();
   const [challenge, setChallenge] = useState(null);
   const [loading, setLoading] = useState(true);
-
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5048';
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     if (!token) return;
-    fetch(`${apiUrl}/api/Challenges/${challengeId}`, {
-      headers: { 'Authorization': `Bearer ${token}` }
-    })
-      .then(res => {
-        if (res.status === 401) {
-          logout();
-          throw new Error('Unauthorized');
-        }
-        if (!res.ok) throw new Error('Failed to fetch');
-        return res.json();
-      })
+    let cancelled = false;
+
+    apiFetch(`/Challenges/${challengeId}`, { token })
       .then(data => {
+        if (cancelled) return;
         setChallenge(data);
         setLoading(false);
       })
       .catch(err => {
-        console.error('Error fetching challenge:', err);
+        if (cancelled) return;
+        if (err instanceof ApiError && err.status === 401) {
+          logout();
+          return;
+        }
+        setError(err instanceof ApiError && err.status === 404
+          ? 'Challenge not found.'
+          : 'Could not load this challenge — the API is unreachable. Run __apiDiagnostics() in the console.');
         setLoading(false);
       });
-  }, [challengeId, token, apiUrl]);
+
+    return () => { cancelled = true; };
+  }, [challengeId, token, logout]);
 
   const toggleCheckbox = async (index) => {
     if (!challenge) return;
-    
-    // Create new state string
+
     const chars = challenge.checkboxesState.split('');
     chars[index] = chars[index] === '1' ? '0' : '1';
     const newState = chars.join('');
-    
+
+    const previous = challenge.checkboxesState;
     // Optimistic update
     setChallenge({ ...challenge, checkboxesState: newState });
 
     try {
-      await fetch(`${apiUrl}/api/Challenges/${challengeId}`, {
+      await apiFetch(`/Challenges/${challengeId}`, {
+        token,
         method: 'PUT',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ checkboxesState: newState })
+        body: { checkboxesState: newState },
       });
-    } catch (error) {
-      console.error('Error updating state:', error);
+      setError(null);
+    } catch (err) {
+      // Roll back so the UI never silently lies about saved state.
+      setChallenge(c => (c ? { ...c, checkboxesState: previous } : c));
+      if (err instanceof ApiError && err.status === 401) {
+        logout();
+        return;
+      }
+      setError('Change was not saved — the API rejected or never received it.');
     }
   };
 
@@ -62,7 +68,7 @@ export default function ChallengeView({ token, logout }) {
   }
 
   if (!challenge) {
-    return <div className="text-red-400">Challenge not found.</div>;
+    return <div className="text-red-400">{error ?? 'Challenge not found.'}</div>;
   }
 
   const checkboxes = challenge.checkboxesState.split('');
@@ -112,6 +118,12 @@ export default function ChallengeView({ token, logout }) {
         })}
       </div>
       
+      {error && (
+        <div className="mt-8 w-full max-w-2xl rounded-2xl border border-red-500/40 bg-red-950/50 px-6 py-3 text-sm text-red-200">
+          {error}
+        </div>
+      )}
+
       <div className="mt-12 text-lg font-medium text-indigo-200">
         Progress: <span className="text-white font-bold">{checkboxes.filter(c => c === '1').length}</span> / 100 Days
       </div>
