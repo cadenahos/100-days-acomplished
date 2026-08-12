@@ -12,6 +12,12 @@
     "test:watch": "vitest",
     "test:ui": "vitest --ui"
   },
+  "pnpm": {
+    "//": "pnpm 10 blocks postinstall scripts by default. esbuild (pulled in by vitest) needs its postinstall to link its native binary, or Vitest cannot start. Declared here rather than via 'pnpm approve-builds' so CI gets it too.",
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
   "dependencies": {
     "@react-oauth/google": "^0.13.5",
     "react": "^19.2.6",
@@ -35,6 +41,6 @@
     "jsdom": "25.0.1",
     "tailwindcss": "^4.3.0",
     "vite": "^8.0.12",
-    "vitest": "3.2.7"
+    "vitest": "4.1.10"
   }
 }
