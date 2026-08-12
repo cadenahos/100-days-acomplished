@@ -1,0 +1,11 @@
+# pnpm reads its settings from this file, not from package.json.
+#
+# pnpm 10+ refuses to run dependency install scripts unless they are explicitly
+# approved, and fails the install with ERR_PNPM_IGNORED_BUILDS otherwise.
+# esbuild (pulled in by vitest) needs its postinstall to link its native binary.
+#
+# In pnpm 11 the old `onlyBuiltDependencies` list was removed in favour of this
+# `allowBuilds` map. Approving individually rather than using
+# `dangerouslyAllowAllBuilds` keeps every other package's scripts blocked.
+allowBuilds:
+  esbuild: true
