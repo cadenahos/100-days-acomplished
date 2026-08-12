@@ -108,6 +108,31 @@ still holds a placeholder; a Mongo URI with the wrong scheme or pointing at
 localhost; a client ID with the wrong suffix; and a runtime SA that can't read
 the secrets.
 
+## Tests
+
+They gate the pipeline — the `test` job runs before any image is built, and
+`backend` depends on it, so a failing test means nothing deploys.
+
+```bash
+# Backend — xUnit
+dotnet test tests/Backend.Tests/Backend.Tests.csproj
+
+# Frontend — Vitest + React Testing Library
+cd frontend && pnpm install && pnpm test
+pnpm run test:watch      # while developing
+```
+
+The backend test project lives in `tests/` rather than `backend/` so the Docker
+build context stays free of test code.
+
+| Suite | What it covers |
+|---|---|
+| `StreakRulesTests.cs` | Sequencing, one-check-per-day, the catch-up allowance, undo rules, the start-date gate, and midnight boundaries. Every test pins an explicit `now` — a test that read the wall clock would pass all day and fail at midnight. |
+| `api.test.js` | That the API base stays relative, bearer headers, and the distinction between a network failure, a 401, a 409 rule rejection, and a 503. |
+| `ConfirmDialog.test.jsx` | Focus lands on Cancel not Delete, Escape and backdrop close, buttons disable mid-request, scroll lock is released. |
+| `ChallengeView.test.jsx` | Which boxes are clickable, that locked boxes make no API call, that undo posts the right index, and that server rule messages are shown verbatim. |
+| `Home.test.jsx` | Creation (name validation, start-date default and bounds, the POST payload, navigation to the new challenge) and selection (listing, clicking the right card, and that the delete control opens the dialog instead of navigating). |
+
 ## Diagnosing a broken deploy
 
 ### 1. Run the layered check
