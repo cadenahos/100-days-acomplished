@@ -87,6 +87,38 @@ describe('ChallengeView grid rules', () => {
     expect(screen.getByText(/missed a day/i)).toBeInTheDocument();
   });
 
+  it('shows the start date once the challenge is running', async () => {
+    await renderView(payload({ done: 3, extra: { startDateUtc: '2026-08-10T00:00:00Z' } }));
+    expect(screen.getByText(/Started .*Aug.*10.*2026/)).toBeInTheDocument();
+  });
+
+  it('says "Starts" for a challenge that has not begun', async () => {
+    await renderView(payload({
+      done: 0,
+      canCheckNow: false,
+      extra: {
+        startDateUtc: '2026-08-19T00:00:00Z',
+        notStartedYet: true,
+        blockedMessage: 'This challenge starts in 7 days, on 2026-08-19.',
+      },
+    }));
+    expect(screen.getByText(/Starts .*Aug.*19.*2026/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Started/)).not.toBeInTheDocument();
+  });
+
+  // Midnight UTC formatted in a negative-offset local zone would render the
+  // previous day, so the date must be formatted in UTC.
+  it('renders the stored UTC date, not a locale-shifted one', async () => {
+    await renderView(payload({ done: 1, extra: { startDateUtc: '2026-08-10T00:00:00Z' } }));
+    expect(screen.queryByText(/Aug.*9.*2026/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Aug.*10.*2026/)).toBeInTheDocument();
+  });
+
+  it('omits the line entirely for challenges with no start date', async () => {
+    await renderView(payload({ done: 3, extra: { startDateUtc: null } }));
+    expect(screen.queryByText(/^Start(s|ed)/)).not.toBeInTheDocument();
+  });
+
   it('shows progress from the server count, not from the raw string', async () => {
     await renderView(payload({ done: 12 }));
     // Scoped to the progress line — a bare getByText('12') would also match
